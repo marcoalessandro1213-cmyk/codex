@@ -1,0 +1,239 @@
+# Reprocesar el archivo de Marina incorporando:
+# - "viva" como positivo SIEMPRE
+# - "mentiras" como negativo duro SIEMPRE
+# Manteniendo las reglas estrictas+auditoría de la REV2
+
+import pandas as pd
+import numpy as np
+import re
+import math
+from datetime import datetime
+from pathlib import Path
+
+INPUT = Path("/mnt/data/Marina 15Sep-10CT.xlsx")
+OUTPUT = Path("/mnt/data/Reporte_NLP_Marina_REV3_FINAL.xlsx")
+
+def normalize_text(s: str) -> str:
+    if pd.isna(s): return ""
+    s = str(s).strip().lower()
+    s = (s.replace("á","a").replace("é","e").replace("í","i")
+           .replace("ó","o").replace("ú","u").replace("ü","u").replace("ñ","n"))
+    s = re.sub(r"\s+"," ", s)
+    return s
+
+URL_RE = re.compile(r"(https?://|www\.)", re.IGNORECASE)
+
+REQUEST_CUES = [
+    "por favor","porfa","podria","podrian","puede","pueden","puden","pudieran","favor de",
+    "solicito","solicitamos","reporte","reporto","reportar","me apoyen","me pueden apoyar",
+    "urge","urgen","se requiere","se solicita","apoyo con","apoyen con","ayuda","ayuden",
+    "cuando viene","cuando van","a donde","donde puedo","como puedo","me informan","me dicen",
+    "ubicacion","colonia","calle","alcaldia","delegacion","entre calles","numero","cp","codigo postal",
+    "telefono","correo","contacto","agendar","cita","que haga","que hagan","programen","envien",
+    "para cuando","cuanto tardan","donde estan","necesito","requiero","favor"
+]
+INFO_CUES = [
+    "hay","se encuentra","se localiza","pasa en","sucede en","en la colonia","en la calle",
+    "frente a","esquina con","altura de","entre","numero","cp","codigo postal","mapa","ubicado",
+    "foto","video"
+]
+
+# NEGATIVOS DUROS (incluye "mentiras")
+NEG_HARD = [
+    "corrup","rata","basura","renuncia","fuera","no te voto","traicion","vende","inepto",
+    "mediocre","fraude","mentira","mentiras","ladron","ratero","ineficien","ineficaz","hipocrita","inepta",
+    "asco","pesimo","ridiculo","vergüenza","verguenza","pobre","malisimo","inutil","payaso","payasa"
+]
+NEG_PATTERNS = [
+    r"\bno sirven\b", r"\bno hacen nada\b", r"\bno funciona\b", r"\bno funciona[n]?\b",
+    r"\bdejen de\b", r"\bya ponganse\b", r"\bpara que\b.*sirve", r"\bde nada sirve\b",
+    r"\bpor que no\b", r"\bcuando van a\b", r"\bpara cuando\b"
+]
+
+# POSITIVOS (incluye "viva" como siempre positivo)
+POS_CUES = [
+    "gracias","felicid","excelent","bravo","apoyo","vamos","orgullo","bien hecho",
+    "me gusta","buen trabajo","buenisimo","aplausos","te apoyo","estoy contigo","cuenta conmigo",
+    "grande","muy bien","aplaudo","reconozco","apoyo total","apoyo al 100","viva"
+]
+POS_EMOJIS = ["❤️","💪","👏","👍","🙌","😍","🤩","🔥","✨","😊","🙂","🥳","💯","✅","🫶"]
+
+HASHTAG_POS = ["#vamos","#[a-z]*contigo","#apoyamos","#orgullo","#siemprecontigo","#equipo","#logro","#bien","#cumplido"]
+HASHTAG_NEG = ["#fuera","#renuncia","#corruptos","#inutiles","#nomerepresenta","#fracaso","#mentira","#mentiras","#ineptos"]
+
+def any_substr(text, cues):
+    return any(c in text for c in cues)
+
+def regex_any(text, patterns):
+    return any(re.search(p, text) for p in patterns)
+
+def detect_flags(raw_text):
+    t = normalize_text(raw_text)
+    flags = {
+        "Tiene_URL": bool(URL_RE.search(raw_text or "")),
+        "Es_Petición": any_substr(t, REQUEST_CUES),
+        "Es_Información": any_substr(t, INFO_CUES),
+        "Tiene_Elogio": any_substr(t, POS_CUES) or any(e in (raw_text or "") for e in POS_EMOJIS),
+        "Tiene_NegDuro": any_substr(t, NEG_HARD) or regex_any(t, NEG_PATTERNS),
+        "Hashtag_Pos": any(re.search(ht, t) for ht in HASHTAG_POS),
+        "Hashtag_Neg": any(re.search(ht, t) for ht in HASHTAG_NEG),
+        "MAYUS_Intenso": len(re.findall(r"\b[A-ZÁÉÍÓÚÜÑ]{3,}\b", str(raw_text))) >= 2,
+        "Sarcasmo/Queja": any(re.search(p, t) for p in [r"\bsi como no\b", r"\bclaro\b\s+que\s+si", r"\baja\b", r"\baja\b", r"\baj[aá]\b"]),
+        "Solo_Emoji": bool(re.fullmatch(r"\W{1,4}", str(raw_text or "")))
+    }
+    return flags
+
+def decide_class(flags, t):
+    # 1) Negativo fuerte si hay cues duros o hashtags negativos
+    if flags["Tiene_NegDuro"] or flags["Hashtag_Neg"]:
+        return "Desaprobación", "Negativo duro / hashtag", ["neg_hard/hashtag_neg"]
+    # 2) Neutral por URL, petición o info
+    if flags["Tiene_URL"] or flags["Es_Petición"] or flags["Es_Información"]:
+        return "Neutral", "Petición/Información o enlace", ["url/peticion/info"]
+    # 3) Desaprobación por tono enfático/sarcástico (sin petición/URL)
+    if flags["MAYUS_Intenso"] and (" no " in t or "nunca" in t or "jamas" in t or flags["Sarcasmo/Queja"]):
+        return "Desaprobación", "Tono negativo enfático", ["mayusculas/sarcasmo"]
+    # 4) Aprobación si hay elogio/emoji/hashtag positivo (o 'viva') y no hay petición/URL
+    if flags["Tiene_Elogio"] or flags["Hashtag_Pos"]:
+        return "Aprobación", "Elogio claro sin petición/enlace", ["elogio/hashtag_pos"]
+    # 5) Neutral por defecto
+    return "Neutral", "Sin señales claras (regla por defecto)", []
+
+def compute_daily_stats(df_day):
+    n = len(df_day)
+    out = []
+    for cls in ["Aprobación","Neutral","Desaprobación"]:
+        k = (df_day["Clasificación"] == cls).sum()
+        p = k / n if n else 0.0
+        moe = 1.96 * math.sqrt(p*(1-p)/n) if n else None
+        out.append({"Clase": cls, "n": n, "k": int(k), "Porcentaje": round(p*100,2), "MoE_95": round(moe*100,2) if moe is not None else None})
+    return pd.DataFrame(out)
+
+# ------------------ Proceso ------------------
+xls = pd.ExcelFile(INPUT)
+rows = []
+
+for sh in xls.sheet_names:
+    df = pd.read_excel(INPUT, sheet_name=sh)
+    if df.empty: 
+        continue
+    cols_lower = {str(c).lower(): c for c in df.columns}
+    if "content" not in cols_lower or "commentat" not in cols_lower:
+        continue
+    text_col = cols_lower["content"]
+    date_col = cols_lower["commentat"]
+
+    df["_texto"] = df[text_col].astype(str)
+    df["_texto_norm"] = df["_texto"].map(normalize_text)
+    df["_fecha"] = pd.to_datetime(df[date_col], errors="coerce")
+
+    mask = (~df["_texto_norm"].isna()) & (df["_texto_norm"]!="") & (df["_texto_norm"]!="0") & \
+           (df["_texto_norm"].str.replace(r"[^0-9a-zA-Z]+","", regex=True).str.len()>=3) & \
+           (df["_fecha"].notna())
+    dfv = df[mask].copy()
+    if dfv.empty:
+        continue
+
+    author_col = None
+    for cand in df.columns:
+        name = str(cand).lower()
+        if any(k in name for k in ["author","usuario","nombre","from","user"]):
+            author_col = cand
+            break
+
+    for _, r in dfv.iterrows():
+        raw = r["_texto"]
+        t = normalize_text(raw)
+        flags = detect_flags(raw)
+        cls, reason, trig = decide_class(flags, t)
+        rows.append({
+            "Fecha": pd.to_datetime(r["_fecha"].date()),
+            "Autor": r[author_col] if (author_col is not None and author_col in dfv.columns) else np.nan,
+            "Comentario": raw,
+            "Clasificación": cls,
+            "Razón": reason,
+            "Trigger": ", ".join(trig),
+            "Tiene_URL": flags["Tiene_URL"],
+            "Es_Petición": flags["Es_Petición"],
+            "Es_Información": flags["Es_Información"],
+            "Tiene_Elogio": flags["Tiene_Elogio"],
+            "Tiene_NegDuro": flags["Tiene_NegDuro"],
+            "Hashtag_Pos": flags["Hashtag_Pos"],
+            "Hashtag_Neg": flags["Hashtag_Neg"],
+            "MAYUS_Intenso": flags["MAYUS_Intenso"],
+            "Sarcasmo/Queja": flags["Sarcasmo/Queja"],
+            "Solo_Emoji": flags["Solo_Emoji"],
+            "Hoja_origen": sh
+        })
+
+df_class = pd.DataFrame(rows)
+if df_class.empty:
+    with pd.ExcelWriter(OUTPUT, engine="xlsxwriter") as writer:
+        pd.DataFrame({"Mensaje":["No se encontraron registros con Content/CommentAt en el archivo."]}).to_excel(writer, sheet_name="Comentarios Clasificados", index=False)
+        pd.DataFrame({"Nota":["Revisa nombres de columnas y que existan fechas parseables."]}).to_excel(writer, sheet_name="Metodología", index=False)
+else:
+    df_class = df_class.sort_values("Fecha").reset_index(drop=True)
+    # Estadístico por día
+    daily_stats = []
+    for date, sub in df_class.groupby(df_class["Fecha"].dt.date):
+        stats = compute_daily_stats(sub)
+        stats.insert(0, "Fecha", pd.to_datetime(date))
+        daily_stats.append(stats)
+    df_stats = pd.concat(daily_stats, ignore_index=True)
+
+    # Promedios (simple y ponderado)
+    pivot = df_stats.pivot_table(index="Fecha", columns="Clase", values="Porcentaje").fillna(0.0)
+    prom_simple = pivot.mean(axis=0).rename("Promedio simple (%)")
+
+    total_n = len(df_class)
+    prom_pond = pd.Series({
+        "Aprobación": round(100*(df_class["Clasificación"]=="Aprobación").sum()/total_n, 2),
+        "Neutral": round(100*(df_class["Clasificación"]=="Neutral").sum()/total_n, 2),
+        "Desaprobación": round(100*(df_class["Clasificación"]=="Desaprobación").sum()/total_n, 2),
+    }).rename("Promedio ponderado (%)")
+
+    # Auditoría (banderas)
+    audit_rates = pd.DataFrame({
+        "Bandera":[
+            "Tiene_URL","Es_Petición","Es_Información","Tiene_Elogio","Tiene_NegDuro",
+            "Hashtag_Pos","Hashtag_Neg","MAYUS_Intenso","Sarcasmo/Queja","Solo_Emoji"
+        ],
+        "Tasa sobre total (%)":[
+            round(100*df_class["Tiene_URL"].mean(),2),
+            round(100*df_class["Es_Petición"].mean(),2),
+            round(100*df_class["Es_Información"].mean(),2),
+            round(100*df_class["Tiene_Elogio"].mean(),2),
+            round(100*df_class["Tiene_NegDuro"].mean(),2),
+            round(100*df_class["Hashtag_Pos"].mean(),2),
+            round(100*df_class["Hashtag_Neg"].mean(),2),
+            round(100*df_class["MAYUS_Intenso"].mean(),2),
+            round(100*df_class["Sarcasmo/Queja"].mean(),2),
+            round(100*df_class["Solo_Emoji"].mean(),2),
+        ]
+    })
+
+    with pd.ExcelWriter(OUTPUT, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as writer:
+        cols = ["Fecha","Autor","Comentario","Clasificación","Razón","Trigger",
+                "Tiene_URL","Es_Petición","Es_Información","Tiene_Elogio","Tiene_NegDuro",
+                "Hashtag_Pos","Hashtag_Neg","MAYUS_Intenso","Sarcasmo/Queja","Solo_Emoji","Hoja_origen"]
+        df_class[cols].to_excel(writer, sheet_name="Comentarios Clasificados", index=False)
+        df_stats.to_excel(writer, sheet_name="Porcentajes del día", index=False)
+        pd.concat([prom_simple, prom_pond], axis=1).reset_index().rename(columns={"index":"Clase"}).to_excel(writer, sheet_name="Promedios", index=False)
+        audit_rates.to_excel(writer, sheet_name="Auditoría (banderas)", index=False)
+        # metodología actualizada
+        pd.DataFrame({
+            "Reglas":[
+                "Se añadió 'viva' como positivo y 'mentiras' como negativo duro (prioridad máxima).",
+                "Jerarquía: Neg duro/hashtag neg > URL/Petición/Info (Neutral) > Elogio claro (Aprobación) > Neutral por defecto.",
+                "Detección de tono: MAYUS intensas y sarcasmo/queja.",
+                "MoE 95% por día y promedios (simple y ponderado)."
+            ]
+        }).to_excel(writer, sheet_name="Metodología", index=False)
+
+from caas_jupyter_tools import display_dataframe_to_user
+if not df_class.empty:
+    display_dataframe_to_user("Promedios — REV3 FINAL", pd.concat([prom_simple, prom_pond], axis=1).reset_index().rename(columns={"index":"Clase"}))
+    display_dataframe_to_user("Comentarios reclasificados (muestra)", df_class.head(120))
+
+OUTPUT.as_posix()
+
